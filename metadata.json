@@ -1,0 +1,6 @@
+{
+  "name": "Elite Toastmasters Evaluation App",
+  "description": "AI-Powered Pathways Speech Evaluator that analyzes live or recorded Toastmasters speeches against Pathways rubrics.",
+  "requestFramePermissions": ["camera", "microphone", "display-capture"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
