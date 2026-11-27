@@ -6,6 +6,12 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
+import {
+  geminiTpmLimiter,
+  generateContentRateLimited,
+  RateLimitQueueError,
+} from './server/tokenRateLimiter.ts';
+import { prepareSpeechMediaForGemini } from './server/mediaProcessor.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -77,6 +83,13 @@ function normalizeMimeType(rawMime: string, filename = ''): string {
   }
 }
 
+const MAX_DOCUMENT_TEXT_CHARS = 200_000;
+
+function truncateDocumentText(text: string): string {
+  if (text.length <= MAX_DOCUMENT_TEXT_CHARS) return text;
+  return `${text.slice(0, MAX_DOCUMENT_TEXT_CHARS)}\n\n[Document truncated to stay within Gemini context window.]`;
+}
+
 async function fileToGeminiParts(file: Express.Multer.File) {
   const mimeType = normalizeMimeType(file.mimetype, file.originalname);
   const ext = path.extname(file.originalname).toLowerCase();
@@ -90,7 +103,11 @@ async function fileToGeminiParts(file: Express.Multer.File) {
     if (!extracted) {
       throw new Error('Could not extract readable text from the uploaded .docx file.');
     }
-    return [{ text: `Extracted document content (${file.originalname}):\n\n${extracted}` }];
+    return [
+      {
+        text: `Extracted document content (${file.originalname}):\n\n${truncateDocumentText(extracted)}`,
+      },
+    ];
   }
 
   if (mimeType.startsWith('text/') || ext === '.txt' || ext === '.md') {
@@ -98,7 +115,11 @@ async function fileToGeminiParts(file: Express.Multer.File) {
     if (!textContent) {
       throw new Error('The uploaded text document appears to be empty.');
     }
-    return [{ text: `Document content (${file.originalname}):\n\n${textContent}` }];
+    return [
+      {
+        text: `Document content (${file.originalname}):\n\n${truncateDocumentText(textContent)}`,
+      },
+    ];
   }
 
   const supportedInline =
@@ -130,17 +151,75 @@ function formatSecondsToMMSS(totalSeconds: number): string {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
+function createRequestAbortSignal(res: Response): {
+  signal: AbortSignal;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) {
+      controller.abort();
+    }
+  };
+  res.on('close', onClose);
+  return {
+    signal: controller.signal,
+    cleanup: () => res.off('close', onClose),
+  };
+}
+
+function extractReadableErrorMessage(rawMessage: string): string {
+  const trimmed = rawMessage.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed) as { error?: { message?: string } };
+      if (parsed?.error?.message) {
+        return parsed.error.message;
+      }
+    } catch {
+      // Keep original string
+    }
+  }
+  return rawMessage;
+}
+
 function handleApiError(err: unknown, res: Response) {
+  if (res.headersSent || res.writableEnded) {
+    return;
+  }
+  if (err instanceof RateLimitQueueError) {
+    if (err.statusCode === 499) {
+      return;
+    }
+    res.setHeader('Retry-After', String(err.retryAfterSeconds));
+    res.status(err.statusCode).json({
+      error: err.message,
+      retryAfterSeconds: err.retryAfterSeconds,
+    });
+    return;
+  }
   console.error('[API Error]', err);
-  const message =
+  const rawMessage =
     err instanceof Error ? err.message : 'An unexpected server error occurred.';
+  const readableMessage = extractReadableErrorMessage(rawMessage);
+
+  if (readableMessage.includes('exceeds the maximum number of tokens')) {
+    res.status(413).json({
+      error:
+        'The submitted media or document exceeded Gemini’s 1,048,576 input token limit. Please try a shorter recording or smaller document.',
+    });
+    return;
+  }
+
   const status =
-    message.includes('PERMISSION_DENIED') || message.includes('API_KEY_INVALID')
+    readableMessage.includes('PERMISSION_DENIED') || readableMessage.includes('API_KEY_INVALID')
       ? 403
-      : message.includes('RESOURCE_EXHAUSTED')
+      : readableMessage.includes('RESOURCE_EXHAUSTED')
         ? 429
-        : 500;
-  res.status(status).json({ error: message });
+        : readableMessage.includes('does not contain an audio track')
+          ? 400
+          : 500;
+  res.status(status).json({ error: readableMessage });
 }
 
 let cachedDemoWavBase64: string | null = null;
@@ -151,7 +230,7 @@ async function startServer() {
 
   const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 50 * 1024 * 1024 },
+    limits: { fileSize: 150 * 1024 * 1024 },
   });
 
   // Accept traffic and API requests from the registered custom subdomain & app URL
@@ -186,7 +265,11 @@ async function startServer() {
   app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, allowedHosts: ALLOWED_HOSTS });
+    res.json({
+      ok: true,
+      allowedHosts: ALLOWED_HOSTS,
+      rateLimiter: geminiTpmLimiter.getStats(),
+    });
   });
 
   // 1. Extract Speaker & Speech Details from Document or Pasted Text
@@ -205,61 +288,71 @@ async function startServer() {
 
         const inputParts = req.file
           ? await fileToGeminiParts(req.file)
-          : [{ text: `Speaker & speech text:\n\n${pastedText}` }];
+          : [{ text: `Speaker & speech text:\n\n${truncateDocumentText(pastedText)}` }];
 
         const promptText = `Extract the Toastmasters speaker and speech setup details from the provided document or text.
 If any field is missing or implicit, infer the most reasonable Toastmasters value (for example, default targetDuration to "5–7 minutes" with minMinutes: 5, maxMinutes: 7 if no timing is mentioned, or parse exact ranges like "4–6 minutes" or "1–2 minutes").`;
 
-        const response = await ai.models.generateContent({
-          model: MODEL_TEXT_MULTIMODAL,
-          contents: {
-            parts: [...inputParts, { text: promptText }],
-          },
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                speakerName: {
-                  type: Type.STRING,
-                  description: 'Full name of the speaker.',
-                },
-                speechTitle: {
-                  type: Type.STRING,
-                  description: 'Title of the speech.',
-                },
-                targetDuration: {
-                  type: Type.STRING,
-                  description: 'Human-readable target speech duration, e.g. "5–7 minutes".',
-                },
-                minMinutes: {
-                  type: Type.NUMBER,
-                  description: 'Minimum target speech duration in minutes (e.g. 5).',
-                },
-                maxMinutes: {
-                  type: Type.NUMBER,
-                  description: 'Maximum target speech duration in minutes (e.g. 7).',
-                },
-                pathwayProject: {
-                  type: Type.STRING,
-                  description: 'Toastmasters Pathway and project name.',
-                },
-                speechPurpose: {
-                  type: Type.STRING,
-                  description: 'Brief summary of the speech purpose or context.',
+        const { signal, cleanup } = createRequestAbortSignal(res);
+        let response;
+        try {
+          response = await generateContentRateLimited(
+            ai,
+            {
+              model: MODEL_TEXT_MULTIMODAL,
+              contents: {
+                parts: [...inputParts, { text: promptText }],
+              },
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    speakerName: {
+                      type: Type.STRING,
+                      description: 'Full name of the speaker.',
+                    },
+                    speechTitle: {
+                      type: Type.STRING,
+                      description: 'Title of the speech.',
+                    },
+                    targetDuration: {
+                      type: Type.STRING,
+                      description: 'Human-readable target speech duration, e.g. "5–7 minutes".',
+                    },
+                    minMinutes: {
+                      type: Type.NUMBER,
+                      description: 'Minimum target speech duration in minutes (e.g. 5).',
+                    },
+                    maxMinutes: {
+                      type: Type.NUMBER,
+                      description: 'Maximum target speech duration in minutes (e.g. 7).',
+                    },
+                    pathwayProject: {
+                      type: Type.STRING,
+                      description: 'Toastmasters Pathway and project name.',
+                    },
+                    speechPurpose: {
+                      type: Type.STRING,
+                      description: 'Brief summary of the speech purpose or context.',
+                    },
+                  },
+                  required: [
+                    'speakerName',
+                    'speechTitle',
+                    'targetDuration',
+                    'minMinutes',
+                    'maxMinutes',
+                    'pathwayProject',
+                  ],
                 },
               },
-              required: [
-                'speakerName',
-                'speechTitle',
-                'targetDuration',
-                'minMinutes',
-                'maxMinutes',
-                'pathwayProject',
-              ],
             },
-          },
-        });
+            { signal, label: 'extract-speaker' }
+          );
+        } finally {
+          cleanup();
+        }
 
         const parsed = JSON.parse((response.text ?? '{}').trim());
         res.json(parsed);
@@ -285,47 +378,57 @@ If any field is missing or implicit, infer the most reasonable Toastmasters valu
 
         const inputParts = req.file
           ? await fileToGeminiParts(req.file)
-          : [{ text: `Evaluation rubric text:\n\n${pastedText}` }];
+          : [{ text: `Evaluation rubric text:\n\n${truncateDocumentText(pastedText)}` }];
 
         const promptText = `Analyze this Toastmasters Pathways Evaluation Form or rubric.
 Extract the form title, project purpose, every specific evaluation criterion / rubric question / rating item found in the form, and general evaluator watch-outs.
 Ensure each criterion has a unique id (like "crit-1", "crit-2", ...), a short category name, the full rubric question/prompt, maxRating (usually 5), and specific watchOuts for the evaluator.`;
 
-        const response = await ai.models.generateContent({
-          model: MODEL_TEXT_MULTIMODAL,
-          contents: {
-            parts: [...inputParts, { text: promptText }],
-          },
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                formTitle: { type: Type.STRING },
-                projectPurpose: { type: Type.STRING },
-                criteria: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      id: { type: Type.STRING },
-                      category: { type: Type.STRING },
-                      question: { type: Type.STRING },
-                      maxRating: { type: Type.NUMBER },
-                      watchOuts: { type: Type.STRING },
+        const { signal, cleanup } = createRequestAbortSignal(res);
+        let response;
+        try {
+          response = await generateContentRateLimited(
+            ai,
+            {
+              model: MODEL_TEXT_MULTIMODAL,
+              contents: {
+                parts: [...inputParts, { text: promptText }],
+              },
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    formTitle: { type: Type.STRING },
+                    projectPurpose: { type: Type.STRING },
+                    criteria: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          id: { type: Type.STRING },
+                          category: { type: Type.STRING },
+                          question: { type: Type.STRING },
+                          maxRating: { type: Type.NUMBER },
+                          watchOuts: { type: Type.STRING },
+                        },
+                        required: ['id', 'category', 'question', 'maxRating', 'watchOuts'],
+                      },
                     },
-                    required: ['id', 'category', 'question', 'maxRating', 'watchOuts'],
+                    generalWatchOuts: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
+                    },
                   },
-                },
-                generalWatchOuts: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
+                  required: ['formTitle', 'projectPurpose', 'criteria', 'generalWatchOuts'],
                 },
               },
-              required: ['formTitle', 'projectPurpose', 'criteria', 'generalWatchOuts'],
             },
-          },
-        });
+            { signal, label: 'extract-rubric' }
+          );
+        } finally {
+          cleanup();
+        }
 
         const parsed = JSON.parse((response.text ?? '{}').trim());
         res.json(parsed);
@@ -351,30 +454,40 @@ So I took a breath, asked two focused questions — what is broken right now, an
 That night taught me something crucial about my leadership style: planning builds the runway, but decisive calm in the storm is what keeps the plane in the air.
 When pressure rises, don't wait for perfect information. Ask two clear questions, trust your team, and take the next right step. Thank you, Mister or Madam Toastmaster.`;
 
-      const response = await ai.models.generateContent({
-        model: MODEL_TTS,
-        contents: [
+      const { signal, cleanup } = createRequestAbortSignal(res);
+      let response;
+      try {
+        response = await generateContentRateLimited(
+          ai,
           {
-            role: 'user',
-            parts: [
+            model: MODEL_TTS,
+            contents: [
               {
-                text: demoScript,
-                speechMetadata: {
-                  style: 'Warm, articulate Toastmasters speaker delivering a short keynote story with natural pacing and brief pauses',
-                },
+                role: 'user',
+                parts: [
+                  {
+                    text: demoScript,
+                    speechMetadata: {
+                      style: 'Warm, articulate Toastmasters speaker delivering a short keynote story with natural pacing and brief pauses',
+                    },
+                  },
+                ],
               },
             ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Kore' },
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: 'Kore' },
+                },
+              },
             },
           },
-        },
-      });
+          { signal, label: 'demo-speech-audio' }
+        );
+      } finally {
+        cleanup();
+      }
 
       const base64Audio =
         response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
@@ -437,17 +550,26 @@ When pressure rises, don't wait for perfect information. Ask two clear questions
 
         const mediaMime = normalizeMimeType(req.file.mimetype, req.file.originalname);
 
+        // Convert video uploads and oversized audio files into compact speech audio + sampled keyframes
+        // so Gemini never hits the 1,048,576 input token context ceiling.
+        const prepared = await prepareSpeechMediaForGemini({
+          buffer: req.file.buffer,
+          mimeType: mediaMime,
+          filename: req.file.originalname,
+          durationSecondsHint: actualSeconds,
+          existingKeyframes: keyframes,
+        });
+
         const parts: Array<Record<string, unknown>> = [
           {
             inlineData: {
-              mimeType: mediaMime,
-              data: req.file.buffer.toString('base64'),
+              mimeType: prepared.audioMimeType,
+              data: prepared.audioBuffer.toString('base64'),
             },
           },
         ];
 
-        // Attach visual keyframes sampled from shared screen / video if provided
-        const limitedKeyframes = Array.isArray(keyframes) ? keyframes.slice(0, 10) : [];
+        const limitedKeyframes = prepared.keyframes;
         for (const frame of limitedKeyframes) {
           if (frame?.base64Data) {
             parts.push({
@@ -461,9 +583,9 @@ When pressure rises, don't wait for perfect information. Ask two clear questions
 
         const evaluationPrompt = `You are an Elite Toastmasters Speech Evaluator — encouraging, specific, perceptive, and deeply grounded in Toastmasters Pathways standards.
 
-Analyze the attached speech recording (audio/video${
+Analyze the attached speech recording (speech audio${
           limitedKeyframes.length > 0
-            ? ` plus ${limitedKeyframes.length} visual screen/camera frames captured during the delivery`
+            ? ` plus ${limitedKeyframes.length} visual screen/camera keyframes captured across the delivery`
             : ''
         }) using the Speaker Details and Evaluation Rubric below.
 
@@ -491,155 +613,169 @@ ${JSON.stringify(rubric, null, 2)}
 
         parts.push({ text: evaluationPrompt });
 
-        const response = await ai.models.generateContent({
-          model: MODEL_TEXT_MULTIMODAL,
-          contents: { parts },
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                timingReport: {
+        const { signal, cleanup } = createRequestAbortSignal(res);
+        let response;
+        try {
+          response = await generateContentRateLimited(
+            ai,
+            {
+              model: MODEL_TEXT_MULTIMODAL,
+              contents: { parts },
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
                   type: Type.OBJECT,
                   properties: {
-                    speakerName: { type: Type.STRING },
-                    speechTitle: { type: Type.STRING },
-                    pathwayProject: { type: Type.STRING },
-                    actualDurationFormatted: { type: Type.STRING },
-                    actualSeconds: { type: Type.NUMBER },
-                    targetRangeFormatted: { type: Type.STRING },
-                    minSeconds: { type: Type.NUMBER },
-                    maxSeconds: { type: Type.NUMBER },
-                    gracePeriodSeconds: { type: Type.NUMBER },
-                    qualificationStatus: {
-                      type: Type.STRING,
-                      enum: ['QUALIFIED', 'UNDER_TIME', 'OVERTIME'],
+                    timingReport: {
+                      type: Type.OBJECT,
+                      properties: {
+                        speakerName: { type: Type.STRING },
+                        speechTitle: { type: Type.STRING },
+                        pathwayProject: { type: Type.STRING },
+                        actualDurationFormatted: { type: Type.STRING },
+                        actualSeconds: { type: Type.NUMBER },
+                        targetRangeFormatted: { type: Type.STRING },
+                        minSeconds: { type: Type.NUMBER },
+                        maxSeconds: { type: Type.NUMBER },
+                        gracePeriodSeconds: { type: Type.NUMBER },
+                        qualificationStatus: {
+                          type: Type.STRING,
+                          enum: ['QUALIFIED', 'UNDER_TIME', 'OVERTIME'],
+                        },
+                        timingCommentary: { type: Type.STRING },
+                      },
+                      required: [
+                        'speakerName',
+                        'speechTitle',
+                        'pathwayProject',
+                        'actualDurationFormatted',
+                        'actualSeconds',
+                        'targetRangeFormatted',
+                        'minSeconds',
+                        'maxSeconds',
+                        'gracePeriodSeconds',
+                        'qualificationStatus',
+                        'timingCommentary',
+                      ],
                     },
-                    timingCommentary: { type: Type.STRING },
-                  },
-                  required: [
-                    'speakerName',
-                    'speechTitle',
-                    'pathwayProject',
-                    'actualDurationFormatted',
-                    'actualSeconds',
-                    'targetRangeFormatted',
-                    'minSeconds',
-                    'maxSeconds',
-                    'gracePeriodSeconds',
-                    'qualificationStatus',
-                    'timingCommentary',
-                  ],
-                },
-                rubricBreakdown: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      criterionId: { type: Type.STRING },
-                      category: { type: Type.STRING },
-                      question: { type: Type.STRING },
-                      rating: { type: Type.NUMBER },
-                      maxRating: { type: Type.NUMBER },
-                      ratingLabel: { type: Type.STRING },
-                      evidenceAndFeedback: { type: Type.STRING },
-                    },
-                    required: [
-                      'criterionId',
-                      'category',
-                      'question',
-                      'rating',
-                      'maxRating',
-                      'ratingLabel',
-                      'evidenceAndFeedback',
-                    ],
-                  },
-                },
-                crcFeedback: {
-                  type: Type.OBJECT,
-                  properties: {
-                    commendations: {
+                    rubricBreakdown: {
                       type: Type.ARRAY,
                       items: {
                         type: Type.OBJECT,
                         properties: {
-                          title: { type: Type.STRING },
-                          detail: { type: Type.STRING },
-                          evidence: { type: Type.STRING },
+                          criterionId: { type: Type.STRING },
+                          category: { type: Type.STRING },
+                          question: { type: Type.STRING },
+                          rating: { type: Type.NUMBER },
+                          maxRating: { type: Type.NUMBER },
+                          ratingLabel: { type: Type.STRING },
+                          evidenceAndFeedback: { type: Type.STRING },
                         },
-                        required: ['title', 'detail', 'evidence'],
+                        required: [
+                          'criterionId',
+                          'category',
+                          'question',
+                          'rating',
+                          'maxRating',
+                          'ratingLabel',
+                          'evidenceAndFeedback',
+                        ],
                       },
                     },
-                    recommendations: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          title: { type: Type.STRING },
-                          detail: { type: Type.STRING },
-                          actionableStep: { type: Type.STRING },
-                        },
-                        required: ['title', 'detail', 'actionableStep'],
-                      },
-                    },
-                    challenge: {
+                    crcFeedback: {
                       type: Type.OBJECT,
                       properties: {
-                        title: { type: Type.STRING },
-                        detail: { type: Type.STRING },
-                      },
-                      required: ['title', 'detail'],
-                    },
-                  },
-                  required: ['commendations', 'recommendations', 'challenge'],
-                },
-                deliveryMetrics: {
-                  type: Type.OBJECT,
-                  properties: {
-                    pacingWpmEstimate: { type: Type.STRING },
-                    pacingNotes: { type: Type.STRING },
-                    vocalVarietyNotes: { type: Type.STRING },
-                    fillerWords: {
-                      type: Type.OBJECT,
-                      properties: {
-                        totalCount: { type: Type.NUMBER },
-                        breakdown: {
+                        commendations: {
                           type: Type.ARRAY,
                           items: {
                             type: Type.OBJECT,
                             properties: {
-                              word: { type: Type.STRING },
-                              count: { type: Type.NUMBER },
+                              title: { type: Type.STRING },
+                              detail: { type: Type.STRING },
+                              evidence: { type: Type.STRING },
                             },
-                            required: ['word', 'count'],
+                            required: ['title', 'detail', 'evidence'],
                           },
                         },
-                        notes: { type: Type.STRING },
+                        recommendations: {
+                          type: Type.ARRAY,
+                          items: {
+                            type: Type.OBJECT,
+                            properties: {
+                              title: { type: Type.STRING },
+                              detail: { type: Type.STRING },
+                              actionableStep: { type: Type.STRING },
+                            },
+                            required: ['title', 'detail', 'actionableStep'],
+                          },
+                        },
+                        challenge: {
+                          type: Type.OBJECT,
+                          properties: {
+                            title: { type: Type.STRING },
+                            detail: { type: Type.STRING },
+                          },
+                          required: ['title', 'detail'],
+                        },
                       },
-                      required: ['totalCount', 'breakdown', 'notes'],
+                      required: ['commendations', 'recommendations', 'challenge'],
                     },
-                    visualPresenceNotes: { type: Type.STRING },
+                    deliveryMetrics: {
+                      type: Type.OBJECT,
+                      properties: {
+                        pacingWpmEstimate: { type: Type.STRING },
+                        pacingNotes: { type: Type.STRING },
+                        vocalVarietyNotes: { type: Type.STRING },
+                        fillerWords: {
+                          type: Type.OBJECT,
+                          properties: {
+                            totalCount: { type: Type.NUMBER },
+                            breakdown: {
+                              type: Type.ARRAY,
+                              items: {
+                                type: Type.OBJECT,
+                                properties: {
+                                  word: { type: Type.STRING },
+                                  count: { type: Type.NUMBER },
+                                },
+                                required: ['word', 'count'],
+                              },
+                            },
+                            notes: { type: Type.STRING },
+                          },
+                          required: ['totalCount', 'breakdown', 'notes'],
+                        },
+                        visualPresenceNotes: { type: Type.STRING },
+                      },
+                      required: [
+                        'pacingWpmEstimate',
+                        'pacingNotes',
+                        'vocalVarietyNotes',
+                        'fillerWords',
+                        'visualPresenceNotes',
+                      ],
+                    },
+                    spokenEvaluationScript: { type: Type.STRING },
                   },
                   required: [
-                    'pacingWpmEstimate',
-                    'pacingNotes',
-                    'vocalVarietyNotes',
-                    'fillerWords',
-                    'visualPresenceNotes',
+                    'timingReport',
+                    'rubricBreakdown',
+                    'crcFeedback',
+                    'deliveryMetrics',
+                    'spokenEvaluationScript',
                   ],
                 },
-                spokenEvaluationScript: { type: Type.STRING },
               },
-              required: [
-                'timingReport',
-                'rubricBreakdown',
-                'crcFeedback',
-                'deliveryMetrics',
-                'spokenEvaluationScript',
-              ],
             },
-          },
-        });
+            {
+              durationSecondsHint: prepared.detectedDurationSeconds || actualSeconds,
+              signal,
+              label: 'evaluate-speech',
+            }
+          );
+        } finally {
+          cleanup();
+        }
 
         const parsed = JSON.parse((response.text ?? '{}').trim());
         // Enforce deterministic server-verified timing values
@@ -668,30 +804,40 @@ ${JSON.stringify(rubric, null, 2)}
         return;
       }
 
-      const response = await ai.models.generateContent({
-        model: MODEL_TTS,
-        contents: [
+      const { signal, cleanup } = createRequestAbortSignal(res);
+      let response;
+      try {
+        response = await generateContentRateLimited(
+          ai,
           {
-            role: 'user',
-            parts: [
+            model: MODEL_TTS,
+            contents: [
               {
-                text,
-                speechMetadata: {
-                  style: 'Warm, encouraging, articulate Toastmasters speech evaluator',
-                },
+                role: 'user',
+                parts: [
+                  {
+                    text,
+                    speechMetadata: {
+                      style: 'Warm, encouraging, articulate Toastmasters speech evaluator',
+                    },
+                  },
+                ],
               },
             ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Charon' },
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: 'Charon' },
+                },
+              },
             },
           },
-        },
-      });
+          { signal, label: 'tts' }
+        );
+      } finally {
+        cleanup();
+      }
 
       const base64Audio =
         response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;

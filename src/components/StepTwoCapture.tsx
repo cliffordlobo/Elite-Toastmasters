@@ -43,6 +43,28 @@ interface StepTwoCaptureProps {
 
 type CaptureSourceType = 'none' | 'screen' | 'camera' | 'mic' | 'uploaded' | 'demo';
 
+type DisplaySurfaceKind = 'browser' | 'window' | 'monitor' | 'unknown';
+
+interface ExtendedVideoTrackConstraints extends MediaTrackConstraints {
+  displaySurface?: 'browser' | 'window' | 'monitor';
+}
+
+interface ExtendedAudioTrackConstraints extends MediaTrackConstraints {
+  suppressLocalAudioPlayback?: boolean;
+}
+
+interface ExtendedDisplayMediaOptions extends DisplayMediaStreamOptions {
+  video?: boolean | ExtendedVideoTrackConstraints;
+  audio?: boolean | ExtendedAudioTrackConstraints;
+  systemAudio?: 'include' | 'exclude';
+  surfaceSwitching?: 'include' | 'exclude';
+  selfBrowserSurface?: 'include' | 'exclude';
+}
+
+interface ExtendedVideoTrackSettings extends MediaTrackSettings {
+  displaySurface?: 'browser' | 'window' | 'monitor';
+}
+
 export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
   speakerDetails,
   isAnalyzing,
@@ -53,6 +75,8 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
   const [sourceType, setSourceType] = useState<CaptureSourceType>('none');
   const [includeMicWithScreen, setIncludeMicWithScreen] = useState(true);
   const [hasAudioTrack, setHasAudioTrack] = useState(false);
+  const [hasTabAudio, setHasTabAudio] = useState(false);
+  const [hasMicAudio, setHasMicAudio] = useState(false);
   const [captureWarning, setCaptureWarning] = useState<string | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
 
@@ -158,7 +182,6 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
     if (!video || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) {
       return;
     }
-    if (keyframesRef.current.length >= 10) return;
 
     const targetWidth = Math.min(640, video.videoWidth);
     const scale = targetWidth / video.videoWidth;
@@ -171,20 +194,42 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
     if (!ctx) return;
 
     ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
     const base64Data = dataUrl.split(',')[1];
-    if (base64Data) {
-      keyframesRef.current.push({
-        timestampSeconds: Math.round(currentElapsed),
-        mimeType: 'image/jpeg',
-        base64Data,
-      });
+    if (!base64Data) return;
+
+    const frame: CapturedKeyframe = {
+      timestampSeconds: Math.round(currentElapsed),
+      mimeType: 'image/jpeg',
+      base64Data,
+    };
+
+    const MAX_LIVE_KEYFRAMES = 8;
+    if (keyframesRef.current.length < MAX_LIVE_KEYFRAMES) {
+      keyframesRef.current.push(frame);
+    } else {
+      // Keep the opening frame and replace the closest-spaced interior frame so snapshots span the entire speech
+      let removeIdx = 1;
+      let smallestGap = Infinity;
+      for (let i = 1; i < keyframesRef.current.length - 1; i++) {
+        const gap =
+          keyframesRef.current[i + 1].timestampSeconds -
+          keyframesRef.current[i - 1].timestampSeconds;
+        if (gap < smallestGap) {
+          smallestGap = gap;
+          removeIdx = i;
+        }
+      }
+      keyframesRef.current.splice(removeIdx, 1);
+      keyframesRef.current.push(frame);
     }
   }
 
   async function handleSelectScreen() {
     setCaptureError(null);
     setCaptureWarning(null);
+    setHasTabAudio(false);
+    setHasMicAudio(false);
     stopAllStreams();
     if (uploadedFileUrl) {
       URL.revokeObjectURL(uploadedFileUrl);
@@ -200,37 +245,91 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
     }
 
     try {
-      const displayStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 15, max: 30 } },
-        audio: true,
-      });
+      const extendedOptions: ExtendedDisplayMediaOptions = {
+        video: {
+          displaySurface: 'browser',
+          frameRate: { ideal: 15, max: 30 },
+        },
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          suppressLocalAudioPlayback: false,
+        },
+        systemAudio: 'include',
+        surfaceSwitching: 'include',
+        selfBrowserSurface: 'exclude',
+      };
+
+      let displayStream: MediaStream;
+      try {
+        displayStream = await navigator.mediaDevices.getDisplayMedia(extendedOptions);
+      } catch (constraintErr) {
+        const errName = constraintErr instanceof Error ? constraintErr.name : '';
+        if (errName === 'TypeError' || errName === 'OverconstrainedError') {
+          displayStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: true,
+          });
+        } else {
+          throw constraintErr;
+        }
+      }
+
       displayStreamRef.current = displayStream;
 
       const displayAudioTracks = displayStream.getAudioTracks();
+      const videoTrack = displayStream.getVideoTracks()[0];
+      const videoSettings = videoTrack?.getSettings?.() as ExtendedVideoTrackSettings | undefined;
+      const surface: DisplaySurfaceKind = videoSettings?.displaySurface ?? 'unknown';
+      const isChromium = /Chrome|Chromium|Edg\//i.test(navigator.userAgent);
 
       let micStream: MediaStream | null = null;
+      let micDeclined = false;
       if (includeMicWithScreen && navigator.mediaDevices.getUserMedia) {
         try {
           micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
           micStreamRef.current = micStream;
         } catch {
-          setCaptureWarning(
-            'Microphone access was declined; recording shared tab/system audio only.'
-          );
+          micDeclined = true;
         }
       }
 
-      const hasAnyAudio =
-        displayAudioTracks.length > 0 || (micStream ? micStream.getAudioTracks().length > 0 : false);
-      setHasAudioTrack(hasAnyAudio);
+      const tabAudioActive = displayAudioTracks.length > 0;
+      const micAudioActive = micStream ? micStream.getAudioTracks().length > 0 : false;
+      setHasTabAudio(tabAudioActive);
+      setHasMicAudio(micAudioActive);
+      setHasAudioTrack(tabAudioActive || micAudioActive);
 
-      if (displayAudioTracks.length === 0 && !micStream) {
+      if (!tabAudioActive) {
+        if (!isChromium) {
+          setCaptureWarning(
+            micAudioActive
+              ? 'This browser does not expose a "Share tab audio" option — using Microphone audio instead. For direct tab audio, open this app in Chrome or Edge.'
+              : 'This browser does not support sharing tab audio and Microphone capture is off. Enable "Mix Microphone with Screen Share" or open this app in Chrome or Edge for direct tab audio.'
+          );
+        } else if (surface === 'window') {
+          setCaptureWarning(
+            micAudioActive
+              ? 'You selected an application Window, which never shows a tab-audio toggle in Chrome/Edge — using Microphone audio instead. Click "Re-select Tab" and pick the Browser Tab (or Entire Screen with system audio) for direct speaker audio.'
+              : 'You selected an application Window, which does not include audio in Chrome/Edge. Click "Re-select Tab" and pick a Browser Tab (with "Also share tab audio" on), or enable Microphone capture.'
+          );
+        } else if (surface === 'monitor') {
+          setCaptureWarning(
+            micAudioActive
+              ? 'Entire Screen was shared without system audio — using Microphone audio instead. Click "Re-select Tab" and turn on "Also share system audio" (Windows / macOS 13+), or share the meeting’s Browser Tab.'
+              : 'Entire Screen was shared without system audio. Click "Re-select Tab" and turn on "Also share system audio", choose the meeting’s Browser Tab, or enable Microphone capture.'
+          );
+        } else {
+          setCaptureWarning(
+            micAudioActive
+              ? 'Tab audio was turned off in the browser prompt — using Microphone audio instead. Click "Re-select Tab" and turn on "Also share tab audio" at the bottom of the picker for clearest speaker audio.'
+              : 'No audio track detected. Click "Re-select Tab" and turn on "Also share tab audio" in the Chrome/Edge picker, or enable Microphone capture.'
+          );
+        }
+      } else if (micDeclined) {
         setCaptureWarning(
-          'No audio track detected! Please re-select your browser tab and check "Share tab audio", or enable Microphone capture.'
-        );
-      } else if (displayAudioTracks.length === 0 && micStream) {
-        setCaptureWarning(
-          'Tab audio was not shared — using Microphone audio. For clearest speaker audio, check "Share tab audio" in the browser prompt.'
+          'Microphone access was declined; recording shared tab/system audio only.'
         );
       }
 
@@ -246,6 +345,8 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
             handleStopEvaluation();
           } else {
             stopAllStreams();
+            setHasTabAudio(false);
+            setHasMicAudio(false);
             setSourceType('none');
           }
         });
@@ -536,25 +637,28 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
     }
   }
 
-  function buildCombinedStream(): MediaStream | null {
+  function buildAudioRecordingStream(): MediaStream | null {
     const displayStream = displayStreamRef.current;
     const cameraStream = cameraStreamRef.current;
     const micStream = micStreamRef.current;
 
     if (sourceType === 'camera' && cameraStream) {
-      return cameraStream;
+      const audioTracks = cameraStream.getAudioTracks();
+      return audioTracks.length > 0 ? new MediaStream(audioTracks) : null;
     }
 
     if (sourceType === 'mic' && micStream) {
-      return micStream;
+      return micStream.getAudioTracks().length > 0 ? micStream : null;
     }
 
     if (sourceType === 'screen' && displayStream) {
-      const videoTracks = displayStream.getVideoTracks();
       const displayAudio = displayStream.getAudioTracks();
       const micAudio = micStream ? micStream.getAudioTracks() : [];
 
       if (displayAudio.length > 0 && micAudio.length > 0) {
+        if (audioContextRef.current) {
+          audioContextRef.current.close().catch(() => undefined);
+        }
         const ctx = new AudioContext();
         audioContextRef.current = ctx;
         const dest = ctx.createMediaStreamDestination();
@@ -562,18 +666,18 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
         const srcMic = ctx.createMediaStreamSource(new MediaStream(micAudio));
         srcDisplay.connect(dest);
         srcMic.connect(dest);
-        return new MediaStream([...videoTracks, ...dest.stream.getAudioTracks()]);
+        return new MediaStream(dest.stream.getAudioTracks());
       }
 
       if (displayAudio.length > 0) {
-        return new MediaStream([...videoTracks, ...displayAudio]);
+        return new MediaStream(displayAudio);
       }
 
       if (micAudio.length > 0) {
-        return new MediaStream([...videoTracks, ...micAudio]);
+        return new MediaStream(micAudio);
       }
 
-      return new MediaStream([...videoTracks]);
+      return null;
     }
 
     return null;
@@ -606,7 +710,7 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
         window.setTimeout(() => captureSingleKeyframe(0), 300);
         keyframeIntervalRef.current = window.setInterval(() => {
           captureSingleKeyframe(elapsedRef.current);
-        }, 7000);
+        }, 10000);
       }
 
       timerIntervalRef.current = window.setInterval(() => {
@@ -617,25 +721,33 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
       return;
     }
 
-    // Live Screen / Mic MediaRecorder capture
-    const combinedStream = buildCombinedStream();
-    if (!combinedStream) {
-      setCaptureError('Active media stream not found. Please re-select your capture source.');
+    // Live Screen / Camera / Mic audio-only MediaRecorder capture (paired with sampled visual keyframes)
+    const audioStream = buildAudioRecordingStream();
+    if (!audioStream || audioStream.getAudioTracks().length === 0) {
+      setCaptureError(
+        'No active audio track found to record. Enable "Mix Microphone with Screen Share", share a Browser Tab with "Also share tab audio" on, or check microphone permissions.'
+      );
       return;
     }
 
     recordedChunksRef.current = [];
     keyframesRef.current = [];
 
-    const preferredMime =
-      sourceType === 'mic'
-        ? ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']
-        : ['video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
-
+    const preferredMime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
     const supportedMime = preferredMime.find((m) => MediaRecorder.isTypeSupported(m));
-    const recorder = supportedMime
-      ? new MediaRecorder(combinedStream, { mimeType: supportedMime })
-      : new MediaRecorder(combinedStream);
+    let recorder: MediaRecorder;
+    try {
+      recorder = supportedMime
+        ? new MediaRecorder(audioStream, {
+            mimeType: supportedMime,
+            audioBitsPerSecond: 64000,
+          })
+        : new MediaRecorder(audioStream, { audioBitsPerSecond: 64000 });
+    } catch {
+      recorder = supportedMime
+        ? new MediaRecorder(audioStream, { mimeType: supportedMime })
+        : new MediaRecorder(audioStream);
+    }
 
     mediaRecorderRef.current = recorder;
 
@@ -656,7 +768,7 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
       window.setTimeout(() => captureSingleKeyframe(0), 400);
       keyframeIntervalRef.current = window.setInterval(() => {
         captureSingleKeyframe(elapsedRef.current);
-      }, 8000);
+      }, 10000);
     }
 
     timerIntervalRef.current = window.setInterval(() => {
@@ -680,6 +792,11 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
       1,
       Math.round((Date.now() - startTimestampRef.current) / 1000)
     );
+
+    if (sourceType === 'screen' || sourceType === 'camera') {
+      captureSingleKeyframe(finalElapsed);
+    }
+
     setIsRecording(false);
 
     if (sourceType === 'uploaded' || sourceType === 'demo') {
@@ -701,7 +818,7 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
       return;
     }
 
-    // Stop live MediaRecorder and submit captured blob
+    // Stop live MediaRecorder and submit captured compact audio blob + visual keyframes
     const recorder = mediaRecorderRef.current;
     if (!recorder) return;
 
@@ -717,14 +834,16 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
       }
     });
 
-    const mimeType = recorder.mimeType || (sourceType === 'mic' ? 'audio/webm' : 'video/webm');
-    const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+    const rawMime = recorder.mimeType || 'audio/webm';
+    const cleanAudioMime = rawMime.startsWith('audio/') ? rawMime : 'audio/webm';
+    const ext = cleanAudioMime.includes('mp4') ? 'm4a' : cleanAudioMime.includes('ogg') ? 'ogg' : 'webm';
+    const blob = new Blob(recordedChunksRef.current, { type: cleanAudioMime });
     const capturedName =
       sourceType === 'mic'
-        ? 'captured_speech.webm'
+        ? `captured_speech.${ext}`
         : sourceType === 'camera'
-          ? 'captured_camera_speech.webm'
-          : 'captured_screen_speech.webm';
+          ? `captured_camera_speech.${ext}`
+          : `captured_screen_speech.${ext}`;
     setRecordedBlob(blob);
     setRecordedFilename(capturedName);
 
@@ -969,9 +1088,22 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
         )}
 
         {captureWarning && (
-          <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-700" />
-            <p className="text-xs leading-relaxed">{captureWarning}</p>
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <div className="flex items-start gap-2.5 flex-1 min-w-[240px]">
+              <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-700" />
+              <p className="text-xs leading-relaxed">{captureWarning}</p>
+            </div>
+            {sourceType === 'screen' && !isRecording && !hasTabAudio && (
+              <button
+                type="button"
+                disabled={isAnalyzing}
+                onClick={handleSelectScreen}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-amber-300 bg-white hover:bg-amber-100/70 text-amber-950 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+              >
+                <Monitor className="w-3.5 h-3.5" />
+                Re-select Tab
+              </button>
+            )}
           </div>
         )}
 
@@ -1093,9 +1225,11 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
                   <p className="inline-flex items-center gap-1.5">
                     <Volume2 className="w-3.5 h-3.5 text-[#004165] shrink-0" />
                     <span>
-                      <strong className="text-[#004165]">Tip:</strong> Check{' '}
-                      <span className="font-semibold text-slate-800">&ldquo;Share tab audio&rdquo;</span>{' '}
-                      in the browser prompt so the AI can hear the speaker.
+                      <strong className="text-[#004165]">Tip:</strong> Choose the{' '}
+                      <span className="font-semibold text-slate-800">Browser Tab</span> option in
+                      Chrome/Edge and enable{' '}
+                      <span className="font-semibold text-slate-800">&ldquo;Also share tab audio&rdquo;</span>{' '}
+                      (sharing an application Window does not include audio).
                     </span>
                   </p>
                 )}
@@ -1103,15 +1237,41 @@ export const StepTwoCapture: React.FC<StepTwoCaptureProps> = ({
                 {(sourceType === 'screen' || sourceType === 'camera') && (
                   <span
                     className={`inline-flex items-center gap-1 font-medium ${
-                      hasAudioTrack ? 'text-emerald-700' : 'text-amber-700'
+                      sourceType === 'screen'
+                        ? hasTabAudio
+                          ? 'text-emerald-700'
+                          : 'text-amber-700'
+                        : hasAudioTrack
+                          ? 'text-emerald-700'
+                          : 'text-amber-700'
                     }`}
                   >
-                    {hasAudioTrack ? (
+                    {sourceType === 'camera' ? (
+                      hasAudioTrack ? (
+                        <>
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          {`Camera (${cameraFacingMode === 'user' ? 'Front' : 'Back'}) & mic connected`}
+                        </>
+                      ) : (
+                        <>
+                          <AlertTriangle className="w-3.5 h-3.5" />
+                          No audio track detected
+                        </>
+                      )
+                    ) : hasTabAudio && hasMicAudio ? (
                       <>
                         <CheckCircle2 className="w-3.5 h-3.5" />
-                        {sourceType === 'camera'
-                          ? `Camera (${cameraFacingMode === 'user' ? 'Front' : 'Back'}) & mic connected`
-                          : 'Audio stream connected'}
+                        Tab + mic audio connected
+                      </>
+                    ) : hasTabAudio ? (
+                      <>
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        Tab / system audio connected
+                      </>
+                    ) : hasMicAudio ? (
+                      <>
+                        <Mic className="w-3.5 h-3.5" />
+                        Mic audio only (no tab audio)
                       </>
                     ) : (
                       <>
